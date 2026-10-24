@@ -1,0 +1,36 @@
+{
+  "name": "suporte-ia",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SupportAI — Plataforma SaaS de suporte inteligente com base de conhecimento e IA",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:rules": "npx firebase-tools emulators:exec --only firestore,auth 'vitest run src/tests/rules'",
+    "emulators": "npx firebase-tools emulators:start --only auth,firestore,hosting",
+    "emulators:ui": "npx firebase-tools emulators:start --only auth,firestore,hosting --import=./.firebase-export --export-on-exit",
+    "deploy": "next build && npx firebase-tools deploy --only hosting",
+    "deploy:rules": "npx firebase-tools deploy --only firestore:rules",
+    "deploy:indexes": "npx firebase-tools deploy --only firestore:indexes"
+  },
+  "dependencies": {
+    "firebase": "^11.0.0",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
+  }
+}

@@ -1,0 +1,327 @@
+rules_version = '2';
+
+/**
+ * SupportAI — Firestore Security Rules
+ * 
+ * Architecture: Multi-tenant SaaS with organization isolation.
+ * All sensitive data lives under /organizations/{orgId}/...
+ * 
+ * PRINCIPLES:
+ *  1. Deny all by default.
+ *  2. Every rule requires authentication.
+ *  3. Membership is verified on every organizational access.
+ *  4. Users cannot escalate their own privileges.
+ *  5. Cross-tenant reads are structurally impossible.
+ *
+ * IMPORTANT: These rules are the REAL security boundary.
+ * Frontend route guards are UX-only and can be bypassed.
+ *
+ * Last updated: Etapa 2 — Fundação
+ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // Helper Functions
+    // =========================================================================
+
+    /** True if the request is authenticated. */
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    /** True if the requester IS the specified user. */
+    function isSelf(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    /**
+     * True if the authenticated user has an ACTIVE membership in the org.
+     * This is the core multi-tenancy guard.
+     */
+    function isActiveMember(orgId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data.status == 'active';
+    }
+
+    /**
+     * Returns the member document for the current user in an org.
+     * Only call after confirming the document exists with isActiveMember().
+     */
+    function getMember(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data;
+    }
+
+    /** True if the user has the specified role in the org. */
+    function hasRole(orgId, role) {
+      return isActiveMember(orgId) && getMember(orgId).role == role;
+    }
+
+    /** True if the user is owner OR admin. */
+    function isOwnerOrAdmin(orgId) {
+      return isActiveMember(orgId) && getMember(orgId).role in ['owner', 'admin'];
+    }
+
+    /** True if the user is the org owner. */
+    function isOwner(orgId) {
+      return hasRole(orgId, 'owner');
+    }
+
+    /** True if the user is an agent, admin, or owner (can handle tickets). */
+    function isAgent(orgId) {
+      return isActiveMember(orgId) && getMember(orgId).role in ['owner', 'admin', 'agent'];
+    }
+
+    // =========================================================================
+    // /users/{userId}
+    // =========================================================================
+    match /users/{userId} {
+      // User can read their own profile.
+      allow read: if isSelf(userId);
+
+      // User can create/update ONLY their own profile.
+      // They cannot set arbitrary fields — only the allowed set.
+      allow create: if isSelf(userId) &&
+        request.resource.data.keys().hasOnly(['displayName', 'email', 'photoURL', 'createdAt', 'lastLoginAt']) &&
+        request.resource.data.email == request.auth.token.email;
+
+      allow update: if isSelf(userId) &&
+        request.resource.data.keys().hasOnly(['displayName', 'photoURL', 'lastLoginAt']) &&
+        // Cannot change email or createdAt
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.createdAt == resource.data.createdAt;
+
+      // Deletion not allowed from client.
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // /organizations/{orgId}
+    // =========================================================================
+    match /organizations/{orgId} {
+      // Active members can read their org.
+      allow read: if isActiveMember(orgId);
+
+      // Only authenticated users can create orgs.
+      // The creating user must set themselves as ownerId.
+      // Status must be 'active'. Plan must be 'starter' initially.
+      allow create: if isAuthenticated() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.resource.data.status == 'active' &&
+        request.resource.data.plan == 'starter' &&
+        request.resource.data.keys().hasOnly(['name', 'slug', 'ownerId', 'status', 'plan', 'createdAt', 'updatedAt']) &&
+        request.resource.data.name is string &&
+        request.resource.data.name.size() >= 2 &&
+        request.resource.data.name.size() <= 80;
+
+      // Only owner can update org settings.
+      // Cannot change ownerId or createdAt.
+      allow update: if isOwner(orgId) &&
+        request.resource.data.ownerId == resource.data.ownerId &&
+        request.resource.data.createdAt == resource.data.createdAt;
+
+      // Deletion not allowed from client (requires admin SDK + cascade).
+      allow delete: if false;
+
+      // -----------------------------------------------------------------------
+      // /organizations/{orgId}/members/{userId}
+      // -----------------------------------------------------------------------
+      match /members/{memberId} {
+        // Active members can read the members list (to see colleagues).
+        allow read: if isActiveMember(orgId);
+
+        // The org creator sets up their own membership during onboarding.
+        // Role must be 'owner', status must be 'active'.
+        // No other self-membership creation is allowed.
+        allow create: if isAuthenticated() &&
+          memberId == request.auth.uid &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.role == 'owner' &&
+          request.resource.data.status == 'active' &&
+          // Verify this user is actually the org owner
+          get(/databases/$(database)/documents/organizations/$(orgId)).data.ownerId == request.auth.uid;
+
+        // Owner/admin can update other members (e.g., change role or suspend).
+        // Users CANNOT update their own member document (prevents self-elevation).
+        allow update: if isOwnerOrAdmin(orgId) &&
+          memberId != request.auth.uid &&
+          // Cannot transfer ownership through member update
+          !(request.resource.data.role == 'owner' && resource.data.role != 'owner') &&
+          request.resource.data.userId == resource.data.userId &&
+          request.resource.data.keys().hasOnly(['role', 'status', 'userId', 'joinedAt']);
+
+        // Only owner can remove members (not self).
+        allow delete: if isOwner(orgId) && memberId != request.auth.uid;
+      }
+
+      // -----------------------------------------------------------------------
+      // /organizations/{orgId}/documents/{documentId}
+      // -----------------------------------------------------------------------
+      match /documents/{documentId} {
+        // Active members can read documents.
+        allow read: if isActiveMember(orgId);
+
+        // Only owner/admin can create documents.
+        allow create: if isOwnerOrAdmin(orgId) &&
+          request.resource.data.createdBy == request.auth.uid &&
+          request.resource.data.processingStatus == 'pending' &&
+          request.resource.data.keys().hasOnly([
+            'title', 'fileName', 'mimeType', 'contentHash', 'version',
+            'processingStatus', 'chunkCount', 'createdBy', 'createdAt', 'updatedAt'
+          ]);
+
+        // Owner/admin can update document metadata and status.
+        allow update: if isOwnerOrAdmin(orgId) &&
+          request.resource.data.createdBy == resource.data.createdBy &&
+          request.resource.data.createdAt == resource.data.createdAt;
+
+        // Owner/admin can delete (must cascade-delete chunks client-side).
+        allow delete: if isOwnerOrAdmin(orgId);
+
+        // Chunks subcollection
+        match /chunks/{chunkId} {
+          allow read: if isActiveMember(orgId);
+
+          allow create: if isOwnerOrAdmin(orgId) &&
+            request.resource.data.keys().hasOnly([
+              'text', 'index', 'page', 'section', 'contentHash', 'createdAt'
+            ]) &&
+            request.resource.data.text is string &&
+            request.resource.data.text.size() <= 4000;
+
+          allow update: if false; // Chunks are immutable; delete and recreate.
+          allow delete: if isOwnerOrAdmin(orgId);
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // /organizations/{orgId}/conversations/{conversationId}
+      // -----------------------------------------------------------------------
+      match /conversations/{conversationId} {
+        // Agents/admins/owners can see all conversations.
+        // End users can only see their own.
+        allow read: if isAgent(orgId) ||
+          (isActiveMember(orgId) && resource.data.userId == request.auth.uid);
+
+        // Any active member can start a conversation.
+        allow create: if isActiveMember(orgId) &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.status == 'active' &&
+          request.resource.data.keys().hasOnly(['userId', 'status', 'createdAt', 'updatedAt']);
+
+        // The conversation owner or an agent can update it.
+        allow update: if isAgent(orgId) ||
+          (isActiveMember(orgId) && resource.data.userId == request.auth.uid);
+
+        allow delete: if false;
+
+        // Messages subcollection
+        match /messages/{messageId} {
+          allow read: if isAgent(orgId) ||
+            (isActiveMember(orgId) &&
+              get(/databases/$(database)/documents/organizations/$(orgId)/conversations/$(conversationId)).data.userId == request.auth.uid);
+
+          allow create: if isActiveMember(orgId) &&
+            request.resource.data.keys().hasOnly(['role', 'content', 'citationIds', 'createdAt']) &&
+            request.resource.data.role in ['user', 'assistant'] &&
+            request.resource.data.content is string &&
+            request.resource.data.content.size() > 0 &&
+            request.resource.data.content.size() <= 10000;
+
+          allow update: if false; // Messages are immutable.
+          allow delete: if false;
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // /organizations/{orgId}/tickets/{ticketId}
+      // -----------------------------------------------------------------------
+      match /tickets/{ticketId} {
+        // Agents see all tickets; end users see only their own.
+        allow read: if isAgent(orgId) ||
+          (isActiveMember(orgId) && resource.data.requesterId == request.auth.uid);
+
+        // Active members can create tickets.
+        allow create: if isActiveMember(orgId) &&
+          request.resource.data.requesterId == request.auth.uid &&
+          request.resource.data.status == 'OPEN' &&
+          request.resource.data.keys().hasOnly([
+            'requesterId', 'assignedAgentId', 'category', 'priority',
+            'status', 'summary', 'sourceConversationId', 'createdAt', 'updatedAt'
+          ]);
+
+        // Agents can update tickets (assignment, status transitions, etc.).
+        allow update: if isAgent(orgId) &&
+          // requesterId and createdAt are immutable
+          request.resource.data.requesterId == resource.data.requesterId &&
+          request.resource.data.createdAt == resource.data.createdAt;
+
+        allow delete: if false;
+
+        // Ticket events (audit log)
+        match /events/{eventId} {
+          allow read: if isAgent(orgId) ||
+            (isActiveMember(orgId) &&
+              get(/databases/$(database)/documents/organizations/$(orgId)/tickets/$(ticketId)).data.requesterId == request.auth.uid);
+
+          allow create: if isActiveMember(orgId) &&
+            request.resource.data.actorId == request.auth.uid &&
+            request.resource.data.keys().hasOnly([
+              'actorId', 'eventType', 'previousStatus', 'newStatus', 'createdAt'
+            ]);
+
+          allow update: if false; // Events are immutable audit records.
+          allow delete: if false;
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // /organizations/{orgId}/feedback/{feedbackId}
+      // -----------------------------------------------------------------------
+      match /feedback/{feedbackId} {
+        // Agents/admins can read all feedback; users read their own.
+        allow read: if isAgent(orgId) ||
+          (isActiveMember(orgId) && resource.data.userId == request.auth.uid);
+
+        // Any active member can submit feedback.
+        allow create: if isActiveMember(orgId) &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.rating is int &&
+          request.resource.data.rating >= 1 &&
+          request.resource.data.rating <= 5 &&
+          request.resource.data.keys().hasOnly([
+            'userId', 'conversationId', 'messageId', 'rating', 'reason', 'createdAt'
+          ]);
+
+        allow update: if false; // Feedback is immutable.
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // /organizations/{orgId}/usageEvents/{eventId}
+      // -----------------------------------------------------------------------
+      match /usageEvents/{eventId} {
+        // Only owner/admin can read usage events.
+        allow read: if isOwnerOrAdmin(orgId);
+
+        // Active members can create usage events for themselves.
+        // NOTE: These are informational only — not used as security gates.
+        allow create: if isActiveMember(orgId) &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.keys().hasOnly(['userId', 'eventType', 'quantity', 'createdAt']);
+
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+
+    // =========================================================================
+    // Catch-all: deny everything not explicitly allowed above.
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
